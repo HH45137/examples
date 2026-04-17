@@ -27,7 +27,7 @@ with open(opt.model, 'rb') as f:
         torch.nn.modules.pixelshuffle.PixelShuffle,
     ]
     with torch.serialization.safe_globals(safe_globals):
-        model = torch.load(f)
+        model = torch.load(f, weights_only=False)
 
 img_to_tensor = ToTensor()
 input = img_to_tensor(y).view(1, -1, y.size[1], y.size[0])
