@@ -23,3 +23,6 @@ docs/venv
 # development
 .vscode
 **/.DS_Store
+/super_resolution/models
+/super_resolution/image
+super_resolution/cmd.bat
