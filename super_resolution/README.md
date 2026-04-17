@@ -28,7 +28,7 @@ This example trains a super-resolution network on the [BSD300 dataset](https://w
 ### Train
 
 ```bash
-python main.py --upscale_factor 4 --batchSize 70 --testBatchSize 70 --nEpochs 80 --lr 0.001 --accel
+python main.py --upscale_factor 4 --batchSize 70 --testBatchSize 70 --nEpochs 80 --lr 0.001 --accel --dataset_root_dir "" --models_root_dir ""
 ```
 
 ### Super Resolve

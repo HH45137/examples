@@ -19,6 +19,8 @@ parser.add_argument('--lr', type=float, default=0.01, help='Learning Rate. Defau
 parser.add_argument('--accel', action='store_true', help='Enables acceleration for training, if available')
 parser.add_argument('--threads', type=int, default=4, help='number of threads for data loader to use')
 parser.add_argument('--seed', type=int, default=123, help='random seed to use. Default=123')
+parser.add_argument('--dataset_root_dir', type=str, default=None)
+parser.add_argument('--models_root_dir', type=str, default=None)
 opt = parser.parse_args()
 
 print(opt)
@@ -32,8 +34,11 @@ else:
     device = torch.device("cpu")
 
 print('===> Loading datasets')
-train_set = get_training_set(opt.upscale_factor)
-test_set = get_test_set(opt.upscale_factor)
+if opt.dataset_root_dir is None:
+    print('Not found dataset!')
+    exit(0)
+train_set = get_training_set(opt.upscale_factor, opt.dataset_root_dir)
+test_set = get_test_set(opt.upscale_factor, opt.dataset_root_dir)
 training_data_loader = DataLoader(dataset=train_set, num_workers=opt.threads, batch_size=opt.batchSize, shuffle=True)
 testing_data_loader = DataLoader(dataset=test_set, num_workers=opt.threads, batch_size=opt.testBatchSize, shuffle=False)
 
@@ -74,7 +79,10 @@ def test():
 
 
 def checkpoint(epoch):
-    model_out_path = "models/model_epoch_{}.pth".format(epoch)
+    if opt.models_root_dir is None:
+        print('Not found models dir!')
+        exit(0)
+    model_out_path = f"{opt.models_root_dir}/" + "model_epoch_{}.pth".format(epoch)
     torch.save(model, model_out_path)
     print("Checkpoint saved to {}".format(model_out_path))
 

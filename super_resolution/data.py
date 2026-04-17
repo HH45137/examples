@@ -50,11 +50,7 @@ def target_transform(crop_size):
     ])
 
 
-root = ('F:\\MyDL\\himage_dataset\\himage\\')
-
-def get_training_set(upscale_factor):
-    # root_dir = download_bsd300()
-    root_dir = root
+def get_training_set(upscale_factor, root_dir):
     train_dir = join(root_dir, "train")
     crop_size = calculate_valid_crop_size(512, upscale_factor)
 
@@ -63,8 +59,7 @@ def get_training_set(upscale_factor):
                              target_transform=target_transform(crop_size))
 
 
-def get_test_set(upscale_factor):
-    root_dir = root
+def get_test_set(upscale_factor, root_dir):
     test_dir = join(root_dir, "test")
     crop_size = calculate_valid_crop_size(512, upscale_factor)
 
