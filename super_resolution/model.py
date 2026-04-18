@@ -14,11 +14,11 @@ class Net(nn.Module):
         kernel_size = (3, 3)
         stride = (1, 1)
         
-        self.conv1 = nn.Conv2d(3, 32, kernel_size, stride, pad)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size, stride, pad)
-        self.conv3 = nn.Conv2d(64, 64, kernel_size, stride, pad)
-        self.conv4 = nn.Conv2d(64, 32, kernel_size, stride, pad)
-        self.conv5 = nn.Conv2d(32, 3 * (upscale_factor ** 2), kernel_size, stride, pad)
+        self.conv1 = nn.Conv2d(3, 64, kernel_size, stride, pad)
+        self.conv2 = nn.Conv2d(64, 128, kernel_size, stride, pad)
+        self.conv3 = nn.Conv2d(128, 128, kernel_size, stride, pad)
+        self.conv4 = nn.Conv2d(128, 64, kernel_size, stride, pad)
+        self.conv5 = nn.Conv2d(64, 3 * (upscale_factor ** 2), kernel_size, stride, pad)
         
         self.pixel_shuffle = nn.PixelShuffle(upscale_factor)
         self._initialize_weights()
