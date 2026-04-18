@@ -26,3 +26,4 @@ docs/venv
 /super_resolution/models
 /super_resolution/image
 super_resolution/cmd.bat
+super_resolution/weights.h
