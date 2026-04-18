@@ -29,7 +29,7 @@ for name, param in model.state_dict().items():
         for i, v in enumerate(data):
             if i % 16 == 0:
                 output_file.write("\n    ")
-            output_file.write(f"{v:.4f}f, ")
+            output_file.write(f"{v:.8f}f, ")
         
         output_file.write("\n};\n\n")
         
@@ -39,7 +39,7 @@ for name, param in model.state_dict().items():
             bias_data = model.state_dict()[bias_name].detach().numpy()
             output_file.write(f"const float conv{layer_index}_bias[] = " + "{")
             for v in bias_data:
-                output_file.write(f"{v:.4f}f, ")
+                output_file.write(f"{v:.8f}f, ")
             output_file.write("};\n\n")
         
         layer_index += 1
