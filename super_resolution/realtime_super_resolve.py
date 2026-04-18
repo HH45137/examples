@@ -195,6 +195,7 @@ def run_realtime_video(args):
     if args.output:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         writer = cv2.VideoWriter(args.output, fourcc, fps, (out_width, out_height))
+        writer.set(cv2.CAP_PROP_BITRATE, 5000000)
         print(f"输出视频: {args.output}")
     
     # 性能统计
