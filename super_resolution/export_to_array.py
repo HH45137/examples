@@ -3,8 +3,8 @@ import numpy as np
 from model import Net
 
 # 加载训练好的模型
-model = Net(upscale_factor=2)
-checkpoint = torch.load(r'models\himage4\model_epoch_99.pth', weights_only=False)
+model = Net(upscale_factor=3)
+checkpoint = torch.load(r'models\himage5\model_epoch_100.pth', weights_only=False)
 model.load_state_dict(checkpoint.state_dict())
 model.eval()
 
