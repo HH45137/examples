@@ -60,8 +60,8 @@ class SuperResolutionModel:
         print("模型加载完成!")
         
     def process(self, frame):
-        """处理单帧图像
-        
+        """处理单帧图像 (RGB版本)
+
         Args:
             frame: OpenCV BGR格式图像
             
@@ -70,36 +70,28 @@ class SuperResolutionModel:
         """
         # BGR转RGB
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        # RGB转YCbCr (只处理Y通道)
-        pil_img = Image.fromarray(frame_rgb).convert('YCbCr')
-        y, cb, cr = pil_img.split()
-        
-        # 转换为tensor
+
+        # 直接转 PIL RGB 图像
+        pil_img = Image.fromarray(frame_rgb)
+
+        # 转换为tensor (3通道)
         to_tensor = ToTensor()
-        input_y = to_tensor(y).view(1, -1, y.size[1], y.size[0])
-        input_y = input_y.to(self.device)
-        
+        input_tensor = to_tensor(pil_img).view(1, -1, pil_img.size[1], pil_img.size[0])
+        input_tensor = input_tensor.to(self.device)
+
         # 模型推理
         with torch.no_grad():
-            output_y = self.model(input_y)
-        
+            output_tensor = self.model(input_tensor)
+
         # 转换回图像
-        output_y = output_y.cpu()[0].detach().numpy()
-        output_y = (output_y * 255.0).clip(0, 255)
-        output_y = Image.fromarray(np.uint8(output_y[0]), mode='L')
-        
-        # Cb, Cr通道上采样 (使用双三次插值)
-        cb_up = cb.resize(output_y.size, Image.BICUBIC)
-        cr_up = cr.resize(output_y.size, Image.BICUBIC)
-        
-        # 合并通道
-        result = Image.merge('YCbCr', [output_y, cb_up, cr_up]).convert('RGB')
-        
+        output_tensor = output_tensor.cpu()[0].detach().numpy()
+        output_tensor = (output_tensor.transpose(1, 2, 0) * 255.0).clip(0, 255)
+        output_rgb = Image.fromarray(np.uint8(output_tensor))
+
         # 转回BGR (OpenCV格式)
-        result_np = np.array(result)
+        result_np = np.array(output_rgb)
         result_bgr = cv2.cvtColor(result_np, cv2.COLOR_RGB2BGR)
-        
+
         return result_bgr
 
 
