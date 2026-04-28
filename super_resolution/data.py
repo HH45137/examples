@@ -6,7 +6,7 @@ from torchvision.transforms import Compose, CenterCrop, ToTensor, Resize
 from dataset import DatasetFromFolder
 
 
-CROP_SIZE_4K = 1080
+CROP_SIZE_4K = 720
 
 
 def calculate_valid_crop_size(crop_size, upscale_factor):
