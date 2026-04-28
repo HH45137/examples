@@ -1,3 +1,10 @@
-six
+# 核心依赖
 torch
 torchvision
+numpy
+Pillow
+six
+
+# 替代 OpenCV 的 GPU 友好依赖 (仅需额外安装这两个包)
+imageio          # 视频文件 I/O (FFmpeg 后端)
+imageio-ffmpeg   # FFmpeg 二进制插件 (支持 NVDEC GPU 硬件解码)

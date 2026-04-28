@@ -1,50 +1,520 @@
 #!/usr/bin/env python
 """
-实时视频超分辨率Demo
-Real-Time Video Super Resolution Demo
+实时视频超分辨率Demo (无OpenCV版本)
+Real-Time Video Super Resolution Demo (OpenCV-Free)
+
+完全替代 OpenCV 的技术栈：
+  - 视频文件读取: imageio-ffmpeg (FFmpeg 后端，支持 NVDEC GPU 硬件解码)
+  - 摄像头采集:   ffmpeg subprocess (MJPEG 管道 + Pillow 解码)
+  - 显示窗口:     tkinter (Python 内置，零额外安装)
+  - 颜色转换:     numpy 索引翻转 (零拷贝)
+  - 文字绘制:     Pillow ImageDraw
+  - 视频输出:     imageio-ffmpeg
+
+安装依赖 (仅需 2 个额外包):
+    pip install imageio imageio-ffmpeg
 
 使用方法:
     python realtime_super_resolve.py --model models/himage/model_epoch_80.pth --upscale 4 --source 0
-    
-参数:
-    --model: 模型文件路径
-    --upscale: 上采样倍数 (2, 3, 4)
-    --source: 视频源 (0=摄像头, 视频文件路径)
-    --gpu: 是否使用GPU加速
+    python realtime_super_resolve.py --model models/himage/model_epoch_99.pth --upscale 2 --source video.mp4 --gpu
 """
 
+from __future__ import annotations
+
 import argparse
-import cv2
-import torch
-import numpy as np
-from PIL import Image
-from torchvision.transforms import ToTensor
+import subprocess
+import sys
 import threading
 import time
+from typing import Optional, Sequence, Union
+
+import numpy as np
+import torch
+from PIL import Image, ImageDraw, ImageFont, ImageTk
+from torchvision.transforms import ToTensor
 
 from model import Net
 
+# ---- 延迟导入 imageio (仅视频文件时需要) ----
+
+_imageio_v3 = None
+
+
+def _get_imageio_v3():
+    global _imageio_v3
+    if _imageio_v3 is None:
+        try:
+            import imageio.v3 as _iio
+            _imageio_v3 = _iio
+        except ImportError:
+            raise ImportError(
+                "缺少 imageio 库。请运行: pip install imageio imageio-ffmpeg"
+            )
+    return _imageio_v3
+
+
+# ============================================================================
+#  工具函数
+# ============================================================================
+
+def _has_nvidia_gpu() -> bool:
+    """检测是否存在 NVIDIA GPU"""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi"], capture_output=True, text=True, timeout=5
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _get_ffmpeg_exe() -> str:
+    """获取 imageio-ffmpeg 自带的 ffmpeg 可执行文件路径"""
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except ImportError:
+        # 回退到系统 PATH 中的 ffmpeg
+        return "ffmpeg"
+
+
+def _load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    """加载可用的 TrueType 字体，回退到默认位图字体"""
+    paths = [
+        "arial.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/msyh.ttc",       # 微软雅黑
+        "C:/Windows/Fonts/simhei.ttf",      # 黑体
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    for fp in paths:
+        try:
+            return ImageFont.truetype(fp, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def draw_texts(
+    img_rgb: np.ndarray,
+    texts: Sequence[tuple[str, tuple[int, int], tuple[int, int, int]]],
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+) -> np.ndarray:
+    """在 RGB 图像上批量绘制文字（返回新数组）
+
+    Args:
+        img_rgb:  RGB 图像 (H, W, 3) uint8
+        texts:    [(文字, (x,y), (R,G,B)), ...]
+        font:     PIL ImageFont 对象
+    """
+    pil_img = Image.fromarray(img_rgb)
+    draw = ImageDraw.Draw(pil_img)
+    for text, pos, color in texts:
+        draw.text(pos, text, fill=color, font=font)
+    return np.array(pil_img)
+
+
+# ============================================================================
+#  视频源抽象层
+# ============================================================================
+
+class VideoSource:
+    """统一视频源接口：支持摄像头和视频文件。
+
+    视频文件 → imageio-ffmpeg (可选 NVDEC GPU 硬件解码)
+    摄像头   → ffmpeg 子进程 MJPEG 管道 + Pillow 解码
+    """
+
+    def __init__(self, source: Union[int, str], use_gpu: bool = True):
+        self._source = source
+        self._use_gpu = use_gpu
+        self._is_webcam = self._detect_webcam(source)
+        self._reader = None
+        self._width: int = 0
+        self._height: int = 0
+        self._fps: float = 30.0
+        self._ffmpeg_proc = None
+        self._ffmpeg_buffer = b""
+        self._init_reader()
+
+    @staticmethod
+    def _detect_webcam(source: Union[int, str]) -> bool:
+        if isinstance(source, int):
+            return True
+        if isinstance(source, str) and source.isdigit():
+            return True
+        return False
+
+    def _init_reader(self) -> None:
+        if self._is_webcam:
+            self._init_webcam()
+        else:
+            self._init_video_file()
+
+    # -------- 摄像头 --------
+
+    def _init_webcam(self) -> None:
+        """使用 ffmpeg 子进程通过 MJPEG 管道采集摄像头帧"""
+        cam_idx = int(self._source) if isinstance(self._source, str) else self._source
+        ffmpeg = _get_ffmpeg_exe()
+
+        # Windows: dshow, Linux: v4l2
+        if sys.platform == "win32":
+            # 先枚举摄像头设备名
+            device_name = self._find_win32_webcam(cam_idx, ffmpeg)
+            cmd = [
+                ffmpeg,
+                "-f", "dshow",
+                "-i", f"video={device_name}",
+                "-vcodec", "mjpeg",
+                "-f", "image2pipe",
+                "-avioflags", "direct",
+                "-fflags", "nobuffer",
+                "-flags", "low_delay",
+                "pipe:1",
+            ]
+        else:
+            cmd = [
+                ffmpeg,
+                "-f", "v4l2",
+                "-i", f"/dev/video{cam_idx}",
+                "-vcodec", "mjpeg",
+                "-f", "image2pipe",
+                "pipe:1",
+            ]
+
+        print(f"[INFO] 启动 ffmpeg 摄像头采集 (索引 {cam_idx})...")
+        self._ffmpeg_proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+        )
+
+        # 从第一帧获取分辨率
+        first_frame = self._read_mjpeg_frame()
+        if first_frame is None:
+            self._ffmpeg_proc.terminate()
+            raise RuntimeError("无法从摄像头读取帧。请确认摄像头未被其他程序占用。")
+
+        self._height, self._width = first_frame.shape[:2]
+        self._fps = 30.0
+        print(f"[INFO] 摄像头分辨率: {self._width}x{self._height}")
+
+        # 创建生成器：第一帧已读取，后续帧从管道读取
+        def _webcam_gen(first):
+            yield first
+            while True:
+                frame = self._read_mjpeg_frame()
+                if frame is None:
+                    break
+                yield frame
+
+        self._reader = _webcam_gen(first_frame)
+
+    def _find_win32_webcam(self, cam_idx: int, ffmpeg: str) -> str:
+        """枚举 Windows dshow 摄像头设备并返回第 cam_idx 个设备名"""
+        list_cmd = [ffmpeg, "-list_devices", "true", "-f", "dshow", "-i", "dummy"]
+        result = subprocess.run(list_cmd, capture_output=True, text=True, timeout=15)
+        # ffmpeg 输出在 stderr 中
+        output = result.stderr
+        devices = []
+        in_video_section = False
+        for line in output.splitlines():
+            line = line.strip()
+            if "DirectShow video devices" in line:
+                in_video_section = True
+                continue
+            if in_video_section and line.startswith('"') and 'Alternative' not in line:
+                # 提取引号中的设备名
+                name = line.split('"')[1] if '"' in line else ""
+                if name:
+                    devices.append(name)
+            if in_video_section and not line:
+                break
+
+        if not devices:
+            # 无法枚举，使用默认名称
+            print("[WARN] 无法枚举摄像头设备，尝试使用默认名称 '0'")
+            return "0"
+
+        if cam_idx >= len(devices):
+            print(f"[WARN] 摄像头索引 {cam_idx} 超出范围 (共 {len(devices)} 个)，使用第一个")
+            cam_idx = 0
+
+        print(f"[INFO] 检测到摄像头: {devices[cam_idx]}")
+        return devices[cam_idx]
+
+    def _read_mjpeg_frame(self) -> Optional[np.ndarray]:
+        """从 ffmpeg MJPEG 管道读取一帧，返回 RGB numpy (H, W, 3) 或 None"""
+        if self._ffmpeg_proc is None or self._ffmpeg_proc.poll() is not None:
+            return None
+
+        try:
+            # 读取数据直到收集到完整的 JPEG 帧
+            # JPEG 起始标记: FF D8 FF, 结束标记: FF D9
+            JPEG_SOI = b'\xff\xd8'
+            JPEG_EOI = b'\xff\xd9'
+
+            while True:
+                # 在缓冲区中查找完整帧
+                soi = self._ffmpeg_buffer.find(JPEG_SOI)
+                if soi < 0:
+                    # 没有起始标记，读取更多数据
+                    chunk = self._ffmpeg_proc.stdout.read(65536)
+                    if not chunk:
+                        return None
+                    self._ffmpeg_buffer += chunk
+                    continue
+
+                # 抛弃起始标记之前的无关数据
+                if soi > 0:
+                    self._ffmpeg_buffer = self._ffmpeg_buffer[soi:]
+
+                # 查找结束标记
+                eoi = self._ffmpeg_buffer.find(JPEG_EOI)
+                if eoi < 0:
+                    # 帧不完整，读取更多
+                    chunk = self._ffmpeg_proc.stdout.read(65536)
+                    if not chunk:
+                        return None
+                    self._ffmpeg_buffer += chunk
+                    continue
+
+                # 提取完整帧 (包括 EOI 的两个字节)
+                jpeg_data = self._ffmpeg_buffer[:eoi + 2]
+                self._ffmpeg_buffer = self._ffmpeg_buffer[eoi + 2:]
+
+                # Pillow 解码 JPEG
+                try:
+                    img = Image.open(__import__('io').BytesIO(jpeg_data))
+                    img = img.convert("RGB")
+                    return np.array(img)
+                except Exception:
+                    # 解码失败，继续搜索下一帧
+                    continue
+
+        except Exception:
+            return None
+
+    # -------- 视频文件 --------
+
+    def _init_video_file(self) -> None:
+        iio = _get_imageio_v3()
+        video_path = str(self._source)
+        print(f"[INFO] 打开视频文件: {video_path}")
+
+        ffmpeg_params: list[str] = []
+        if self._use_gpu and _has_nvidia_gpu():
+            ffmpeg_params = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+            print("[INFO] 启用 FFmpeg NVDEC GPU 硬件解码")
+        else:
+            print("[INFO] 使用 FFmpeg CPU 软解")
+
+        # 先尝试通过元数据获取尺寸，若不可靠则从第一帧获取
+        try:
+            props = iio.improps(video_path, plugin="FFMPEG")
+            h, w = props.shape[0], props.shape[1]
+        except Exception:
+            h, w = 0, 0
+
+        try:
+            meta = iio.immeta(video_path, plugin="FFMPEG")
+            self._fps = float(meta.get("fps", 30))
+        except Exception:
+            self._fps = 30.0
+
+        # 创建迭代器
+        self._reader = iio.imiter(video_path, plugin="FFMPEG", ffmpeg_params=ffmpeg_params)
+
+        # 如果元数据尺寸不可靠，读取第一帧获取真实尺寸
+        if not (h and w and np.isfinite(h) and np.isfinite(w)):
+            first_frame = self.read()
+            if first_frame is not None:
+                self._height, self._width = first_frame.shape[:2]
+                # 将第一帧"放回" —— 重建迭代器（无法真正放回，用 generator 包装）
+                orig_iter = self._reader
+
+                def _with_first(ff, it):
+                    yield ff
+                    yield from it
+
+                self._reader = _with_first(first_frame, orig_iter)
+            else:
+                # 完全无法读取，设默认值
+                self._height, self._width = int(h) if h and np.isfinite(h) else 480, \
+                                            int(w) if w and np.isfinite(w) else 640
+        else:
+            self._height, self._width = int(h), int(w)
+
+        print(f"[INFO] 视频分辨率: {self._width}x{self._height}, FPS: {self._fps:.1f}")
+
+    def read(self) -> Optional[np.ndarray]:
+        """读取一帧，返回 RGB numpy (H, W, 3) uint8；流结束返回 None"""
+        if self._reader is None:
+            return None
+        try:
+            frame = next(self._reader)
+        except StopIteration:
+            return None
+        except Exception:
+            return None
+
+        if frame.dtype != np.uint8:
+            frame = frame.clip(0, 255).astype(np.uint8)
+        if frame.ndim == 2:
+            frame = np.stack([frame, frame, frame], axis=-1)
+        return frame
+
+    @property
+    def width(self) -> int:
+        return self._width
+
+    @property
+    def height(self) -> int:
+        return self._height
+
+    @property
+    def fps(self) -> float:
+        return self._fps
+
+    def close(self) -> None:
+        if self._ffmpeg_proc is not None:
+            self._ffmpeg_proc.terminate()
+            try:
+                self._ffmpeg_proc.wait(timeout=2)
+            except Exception:
+                self._ffmpeg_proc.kill()
+            self._ffmpeg_proc = None
+        self._reader = None
+
+
+# ============================================================================
+#  显示窗口 (tkinter, Python 内置)
+# ============================================================================
+
+class Display:
+    """基于 tkinter 的显示窗口（Python 内置，零额外安装）。
+
+    替代 cv2.imshow / cv2.waitKey / cv2.destroyAllWindows。
+    支持按键退出 (q/Esc)、全屏切换 (f)、窗口缩放。
+    """
+
+    def __init__(self, title: str, width: int, height: int):
+        import tkinter as tk
+
+        self._tk = tk
+        self._root = tk.Tk()
+        self._root.title(title)
+        self._root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # 安全清理宽高值（防止 imageio 返回 inf/NaN 导致崩溃）
+        safe_w = int(width) if (width and np.isfinite(width)) else 1280
+        safe_h = int(height) if (height and np.isfinite(height)) else 720
+
+        # 限制最大尺寸
+        screen_w = self._root.winfo_screenwidth()
+        screen_h = self._root.winfo_screenheight()
+        max_w = min(safe_w, screen_w - 100)
+        max_h = min(safe_h, screen_h - 150)
+
+        if safe_w > max_w or safe_h > max_h:
+            scale = min(max_w / safe_w, max_h / safe_h)
+            self._display_w = int(safe_w * scale)
+            self._display_h = int(safe_h * scale)
+            print(f"[INFO] 窗口缩放至: {self._display_w}x{self._display_h} (原始 {safe_w}x{safe_h})")
+        else:
+            self._display_w = safe_w
+            self._display_h = safe_h
+
+        self._root.geometry(f"{self._display_w}x{self._display_h}")
+
+        self._label = tk.Label(self._root, bg="black")
+        self._label.pack(fill=tk.BOTH, expand=True)
+
+        self._running = True
+        self._fullscreen = False
+        self._font_size = max(16, self._display_h // 35)
+        self._font = _load_font(self._font_size)
+        self._photo_ref = None  # 保持 PhotoImage 引用防止被 GC
+
+        # 绑定键盘事件
+        self._root.bind("<Key>", self._on_key)
+        self._root.bind("<Configure>", self._on_resize)
+        self._root.focus_set()
+
+        # 先显示一次空窗口
+        self._root.update()
+
+    def _on_key(self, event) -> None:
+        if event.keysym in ("q", "Escape"):
+            self._running = False
+        elif event.keysym == "f":
+            self._fullscreen = not self._fullscreen
+            self._root.attributes("-fullscreen", self._fullscreen)
+
+    def _on_resize(self, event) -> None:
+        if not self._fullscreen and event.widget == self._root:
+            self._display_w = event.width
+            self._display_h = event.height
+
+    def _on_close(self) -> None:
+        self._running = False
+
+    def show(self, frame_rgb: np.ndarray) -> None:
+        """显示 RGB 格式 numpy 数组 (H, W, 3)"""
+        img = Image.fromarray(frame_rgb)
+
+        # 如果窗口尺寸与图像不匹配，缩放图像
+        if (self._display_w != frame_rgb.shape[1] or
+                self._display_h != frame_rgb.shape[0]):
+            img = img.resize(
+                (self._display_w, self._display_h),
+                Image.Resampling.LANCZOS,
+            )
+
+        self._photo_ref = ImageTk.PhotoImage(img)
+        self._label.config(image=self._photo_ref)
+        self._root.update()
+
+    def should_quit(self) -> bool:
+        """检查是否应该退出（处理 tkinter 事件）"""
+        self._root.update()
+        return not self._running
+
+    @property
+    def font(self) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+        return self._font
+
+    @property
+    def font_size(self) -> int:
+        return self._font_size
+
+    def close(self) -> None:
+        self._running = False
+        try:
+            self._root.destroy()
+        except Exception:
+            pass
+
+
+# ============================================================================
+#  超分辨率模型封装
+# ============================================================================
 
 class SuperResolutionModel:
-    """超分辨率模型封装类"""
-    
-    def __init__(self, model_path, upscale_factor=4, use_gpu=True):
+    """超分辨率模型封装 —— 输入输出均为 RGB uint8"""
+
+    def __init__(self, model_path: str, upscale_factor: int = 4, use_gpu: bool = True):
         self.upscale_factor = upscale_factor
-        self.use_gpu = use_gpu and self._check_gpu()
+        self.use_gpu = use_gpu and torch.cuda.is_available()
         self.device = torch.device("cuda" if self.use_gpu else "cpu")
-        
-        # 加载模型
         self._load_model(model_path)
-        
-    def _check_gpu(self):
-        """检查GPU是否可用"""
-        return torch.cuda.is_available()
-        
-    def _load_model(self, model_path):
-        """加载训练好的模型"""
-        print(f"正在加载模型: {model_path}")
-        print(f"使用设备: {self.device}")
-        
+
+    def _load_model(self, model_path: str) -> None:
+        print(f"[INFO] 正在加载模型: {model_path}")
+        print(f"[INFO] 使用设备: {self.device}")
+
         with open(model_path, 'rb') as f:
             safe_globals = [
                 Net,
@@ -54,93 +524,106 @@ class SuperResolutionModel:
             ]
             with torch.serialization.safe_globals(safe_globals):
                 self.model = torch.load(f, weights_only=False)
-        
+
         self.model = self.model.to(self.device)
         self.model.eval()
-        print("模型加载完成!")
-        
-    def process(self, frame):
-        """处理单帧图像 (RGB版本)
+        print("[INFO] 模型加载完成!")
+
+    def process(self, frame_rgb: np.ndarray) -> np.ndarray:
+        """处理单帧 RGB 图像
 
         Args:
-            frame: OpenCV BGR格式图像
-            
+            frame_rgb: (H, W, 3) uint8
+
         Returns:
-            处理后的BGR格式图像
+            (H*scale, W*scale, 3) uint8
         """
-        # BGR转RGB
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-        # 直接转 PIL RGB 图像
         pil_img = Image.fromarray(frame_rgb)
-
-        # 转换为tensor (3通道)
         to_tensor = ToTensor()
         input_tensor = to_tensor(pil_img).view(1, -1, pil_img.size[1], pil_img.size[0])
         input_tensor = input_tensor.to(self.device)
 
-        # 模型推理
         with torch.no_grad():
             output_tensor = self.model(input_tensor)
 
-        # 转换回图像
         output_tensor = output_tensor.cpu()[0].detach().numpy()
         output_tensor = (output_tensor.transpose(1, 2, 0) * 255.0).clip(0, 255)
-        output_rgb = Image.fromarray(np.uint8(output_tensor))
+        return output_tensor.astype(np.uint8)
 
-        # 转回BGR (OpenCV格式)
-        result_np = np.array(output_rgb)
-        result_bgr = cv2.cvtColor(result_np, cv2.COLOR_RGB2BGR)
 
-        return result_bgr
+# ============================================================================
+#  视频写入器 (imageio v2 FFMPEG 后端)
+# ============================================================================
 
+class SRVideoWriter:
+    """基于 imageio v2 FFMPEG 后端的视频写入器"""
+
+    def __init__(self, path: str, fps: float, width: int, height: int):
+        import imageio  # 使用 v2 API (get_writer)
+        self._writer = imageio.get_writer(
+            path,
+            format="FFMPEG",
+            fps=fps,
+            codec="libx264",
+            ffmpeg_params=["-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p"],
+            output_params=["-pix_fmt", "yuv420p"],
+        )
+        print(f"[INFO] 输出视频: {path} ({width}x{height}, {fps:.1f}fps)")
+
+    def write(self, frame_rgb: np.ndarray) -> None:
+        # imageio v2 FFMPEG writer 需要 RGB uint8 输入
+        self._writer.append_data(frame_rgb)
+
+    def close(self) -> None:
+        self._writer.close()
+
+
+# ============================================================================
+#  异步超分辨率处理器
+# ============================================================================
 
 class AsyncSuperResolution:
     """异步超分辨率处理器 - 使用独立线程处理帧"""
-    
-    def __init__(self, model_path, upscale_factor=4, use_gpu=True):
+
+    def __init__(self, model_path: str, upscale_factor: int = 4, use_gpu: bool = True):
         self.sr_model = SuperResolutionModel(model_path, upscale_factor, use_gpu)
-        self.current_frame = None
-        self.processed_frame = None
+        self.current_frame: Optional[np.ndarray] = None
+        self.processed_frame: Optional[np.ndarray] = None
         self.running = True
         self.frame_ready = False
-        
-        # 启动处理线程
         self.thread = threading.Thread(target=self._process_loop, daemon=True)
         self.thread.start()
-        
-    def _process_loop(self):
-        """后台处理循环"""
+
+    def _process_loop(self) -> None:
         while self.running:
             if self.frame_ready and self.current_frame is not None:
                 self.processed_frame = self.sr_model.process(self.current_frame)
                 self.frame_ready = False
-            time.sleep(0.001)  # 避免CPU占用过高
-            
-    def submit(self, frame):
-        """提交新帧进行处理"""
-        self.current_frame = frame
+            time.sleep(0.001)
+
+    def submit(self, frame_rgb: np.ndarray) -> None:
+        self.current_frame = frame_rgb
         self.frame_ready = True
-        
-    def get_result(self):
-        """获取处理结果"""
+
+    def get_result(self) -> Optional[np.ndarray]:
         return self.processed_frame
-    
-    def is_processing(self):
-        """检查是否正在处理"""
+
+    def is_processing(self) -> bool:
         return self.frame_ready
-    
-    def stop(self):
-        """停止处理"""
+
+    def stop(self) -> None:
         self.running = False
         if self.thread.is_alive():
             self.thread.join(timeout=1.0)
 
 
-def parse_args():
-    """解析命令行参数"""
-    parser = argparse.ArgumentParser(description='实时视频超分辨率')
-    parser.add_argument('--model', type=str, 
+# ============================================================================
+#  命令行参数
+# ============================================================================
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description='实时视频超分辨率 (无OpenCV)')
+    parser.add_argument('--model', type=str,
                         default='models/himage/model_epoch_99.pth',
                         help='模型文件路径')
     parser.add_argument('--upscale', type=int, default=2,
@@ -148,185 +631,147 @@ def parse_args():
     parser.add_argument('--source', type=str, default='0',
                         help='视频源 (0=摄像头, 或视频文件路径)')
     parser.add_argument('--gpu', action='store_true', default=False,
-                        help='是否使用GPU加速')
+                        help='是否使用 GPU 加速')
     parser.add_argument('--show-fps', action='store_true', default=True,
-                        help='显示FPS')
+                        help='显示 FPS')
     parser.add_argument('--output', type=str, default=None,
                         help='输出视频文件路径')
     return parser.parse_args()
 
 
-def run_realtime_video(args):
-    """运行实时视频超分辨率
-    
-    Args:
-        args: 命令行参数
-    """
-    # 确定视频源
+# ============================================================================
+#  主运行函数 —— 同步模式
+# ============================================================================
+
+def run_realtime_video(args: argparse.Namespace) -> None:
     source = args.source
     if source.isdigit():
         source = int(source)
-    
-    # 初始化超分辨率模型
+
+    cap = VideoSource(source, use_gpu=args.gpu)
     sr = SuperResolutionModel(args.model, args.upscale, args.gpu)
-    
-    # 打开视频捕获
-    cap = cv2.VideoCapture(source)
-    if not cap.isOpened():
-        print(f"错误: 无法打开视频源 {source}")
-        return
-    
-    # 获取视频属性
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
-    
-    # 计算输出尺寸
-    out_width = width * args.upscale
-    out_height = height * args.upscale
-    
-    print(f"原始分辨率: {width}x{height}")
+
+    in_width, in_height = cap.width, cap.height
+    out_width = in_width * args.upscale
+    out_height = in_height * args.upscale
+
+    print(f"原始分辨率: {in_width}x{in_height}")
     print(f"超分分辨率: {out_width}x{out_height}")
-    print(f"FPS: {fps}")
-    print("按 'q' 退出")
-    
-    # 创建视频写入器 (如果指定了输出)
-    writer = None
+    print(f"源 FPS: {cap.fps:.1f}")
+    print("按 'q' / 'Esc' 退出, 'f' 切换全屏")
+
+    display = Display(
+        f"Super Resolution {args.upscale}x  |  {in_width}x{in_height} -> {out_width}x{out_height}",
+        out_width, out_height,
+    )
+
+    writer: Optional[SRVideoWriter] = None
     if args.output:
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        writer = cv2.VideoWriter(args.output, fourcc, fps, (out_width, out_height))
-        writer.set(cv2.CAP_PROP_BITRATE, 5000000)
-        print(f"输出视频: {args.output}")
-    
-    # 性能统计
+        writer = SRVideoWriter(args.output, cap.fps, out_width, out_height)
+
     frame_count = 0
-    total_time = 0
+    total_time = 0.0
     fps_display = "FPS: --"
-    
-    # 窗口名称
-    window_name = f'Super Resolution {args.upscale}x'
-    
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
+
+    while True:
+        frame_rgb = cap.read()
+        if frame_rgb is None:
             break
-        
-        # 记录处理开始时间
+
         start_time = time.time()
-        
-        # 超分辨率处理
-        sr_frame = sr.process(frame)
-        
-        # 计算处理时间
+        sr_frame = sr.process(frame_rgb)
         process_time = time.time() - start_time
         total_time += process_time
         frame_count += 1
-        
-        # 计算FPS
+
         if frame_count % 10 == 0:
             avg_time = total_time / frame_count
-            fps_display = f"FPS: {1/avg_time:.1f} | {avg_time*1000:.0f}ms"
-        
-        # 显示FPS
+            fps_display = f"FPS: {1 / avg_time:.1f} | {avg_time * 1000:.0f}ms"
+
         if args.show_fps:
-            cv2.putText(sr_frame, fps_display, (10, 30), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            
-            # 显示分辨率信息
-            res_text = f"{width}x{height} -> {out_width}x{out_height}"
-            cv2.putText(sr_frame, res_text, (10, 70), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        
-        # 显示图像
-        cv2.imshow(window_name, sr_frame)
-        
-        # 保存视频
+            green = (0, 255, 0)
+            sr_frame = draw_texts(sr_frame, [
+                (fps_display, (10, 10), green),
+                (f"{in_width}x{in_height} -> {out_width}x{out_height}",
+                 (10, 10 + display.font_size + 6), green),
+            ], display.font)
+
+        display.show(sr_frame)
         if writer:
             writer.write(sr_frame)
-        
-        # 按键检测
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q') or key == 27:  # q 或 ESC
+        if display.should_quit():
             break
-    
-    # 释放资源
-    cap.release()
+
+    cap.close()
     if writer:
-        writer.release()
-    cv2.destroyAllWindows()
-    
-    # 输出统计信息
+        writer.close()
+    display.close()
+
     if frame_count > 0:
         print(f"\n===== 统计信息 =====")
         print(f"处理帧数: {frame_count}")
         print(f"总处理时间: {total_time:.2f}秒")
-        print(f"平均处理时间: {total_time/frame_count*1000:.1f}毫秒/帧")
-        print(f"平均FPS: {frame_count/total_time:.1f}")
+        print(f"平均处理时间: {total_time / frame_count * 1000:.1f}毫秒/帧")
+        print(f"平均FPS: {frame_count / total_time:.1f}")
 
 
-def run_async_video(args):
-    """使用异步模式运行视频超分 (降低延迟)"""
-    
-    # 确定视频源
+# ============================================================================
+#  主运行函数 —— 异步模式
+# ============================================================================
+
+def run_async_video(args: argparse.Namespace) -> None:
     source = args.source
     if source.isdigit():
         source = int(source)
-    
-    # 初始化异步超分辨率模型
+
+    cap = VideoSource(source, use_gpu=args.gpu)
     sr = AsyncSuperResolution(args.model, args.upscale, args.gpu)
-    
-    # 打开视频捕获
-    cap = cv2.VideoCapture(source)
-    if not cap.isOpened():
-        print(f"错误: 无法打开视频源 {source}")
-        return
-    
-    # 获取视频属性
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    
-    out_width = width * args.upscale
-    out_height = height * args.upscale
-    
-    print(f"异步模式 - 分辨率: {width}x{height} -> {out_width}x{out_height}")
-    print("按 'q' 退出")
-    
-    window_name = f'Async Super Resolution {args.upscale}x'
-    
+
+    in_width, in_height = cap.width, cap.height
+    out_width = in_width * args.upscale
+    out_height = in_height * args.upscale
+
+    print(f"异步模式 - 分辨率: {in_width}x{in_height} -> {out_width}x{out_height}")
+    print("按 'q' / 'Esc' 退出")
+
+    display = Display(
+        f"Async Super Resolution {args.upscale}x",
+        out_width, out_height,
+    )
+
     frame_count = 0
-    display_frame = None
-    
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
+    display_frame: Optional[np.ndarray] = None
+
+    while True:
+        frame_rgb = cap.read()
+        if frame_rgb is None:
             break
-        
+
         frame_count += 1
-        
-        # 提交帧进行处理
-        sr.submit(frame)
-        
-        # 获取之前处理的结果
+        sr.submit(frame_rgb)
         result = sr.get_result()
-        
+
         if result is not None:
             display_frame = result
-            
-            # 显示FPS
             if args.show_fps:
-                cv2.putText(display_frame, "Async Mode", (10, 30), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            
-            cv2.imshow(window_name, display_frame)
-        
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-    
-    sr.stop()
-    cap.release()
-    cv2.destroyAllWindows()
+                display_frame = draw_texts(
+                    display_frame,
+                    [("Async Mode", (10, 10), (0, 255, 0))],
+                    display.font,
+                )
+            display.show(display_frame)
 
+        if display.should_quit():
+            break
+
+    sr.stop()
+    cap.close()
+    display.close()
+
+
+# ============================================================================
+#  入口
+# ============================================================================
 
 if __name__ == '__main__':
     args = parse_args()
