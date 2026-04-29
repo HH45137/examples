@@ -642,13 +642,13 @@ class ONNXSRModel:
         providers = []
         if self.use_gpu:
             providers = [
-                ("CUDAExecutionProvider", {
+                ("DmlExecutionProvider", {
                     "device_id": 0,
                     "arena_extend_strategy": "kNextPowerOfTwo",
                 }),
                 "CPUExecutionProvider",
             ]
-            print(f"[INFO] [ONNX] 使用 GPU: CUDAExecutionProvider")
+            print(f"[INFO] [ONNX] 使用 DML: DmlExecutionProvider")
         else:
             providers = ["CPUExecutionProvider"]
             print(f"[INFO] [ONNX] 使用 CPU: CPUExecutionProvider")
