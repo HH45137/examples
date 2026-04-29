@@ -754,13 +754,14 @@ class PipelineSR:
     """三缓冲流水线超分辨率处理器。
 
     架构:
-        [Reader 线程] -> 输入队列 -> [SR Worker 线程] -> 输出队列 -> [Display 主线程]
+        [Reader 线程] -> 输入队列(8) -> [SR Worker 线程] -> 输出队列(16) -> [Display 主线程]
 
     优势:
         - 读帧 (CPU)、SR 推理 (GPU)、显示 (CPU) 三级流水线并行
         - 避免 CPU/GPU 串行等待，使两者同时工作
         - 队列使用 collections.deque，线程安全且无 GIL 争用
-        - 输入队列最大 2 帧缓冲，延迟低
+        - 背压阻塞提交 (submit)，确保零丢帧
+        - drain() 排空机制，保证末帧不丢失
         - 支持 PyTorch / ONNX Runtime 双后端
     """
 
@@ -769,8 +770,12 @@ class PipelineSR:
         self.running = True
 
         # 无锁双缓冲队列 (deque 的 append/popleft 在 CPython 中是原子的)
-        self._input_queue: deque[np.ndarray] = deque(maxlen=2)
-        self._output_queue: deque[np.ndarray] = deque(maxlen=2)
+        # 输入队列 maxlen=8: 限制读帧提前量，避免背压阻塞时间过长
+        # 输出队列 maxlen=16: 2x 输入容量，防止背压期间输出溢出丢帧
+        self._max_input_queue: int = 8
+        self._max_output_queue: int = 16
+        self._input_queue: deque[np.ndarray] = deque(maxlen=self._max_input_queue)
+        self._output_queue: deque[np.ndarray] = deque(maxlen=self._max_output_queue)
 
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker.start()
@@ -790,9 +795,11 @@ class PipelineSR:
                 time.sleep(0.0005)
 
     def submit(self, frame_rgb: np.ndarray) -> None:
-        """提交一帧（非阻塞）。如果队列满则丢弃旧帧，始终保留最新帧。"""
-        if len(self._input_queue) >= 2:
-            self._input_queue.popleft()
+        """提交一帧（背压阻塞）。队列满时等待 Worker 消费，确保不丢帧。"""
+        while len(self._input_queue) >= self._max_input_queue:
+            if not self.running:
+                return
+            time.sleep(0.0005)
         self._input_queue.append(frame_rgb)
 
     def get_result(self) -> Optional[np.ndarray]:
@@ -800,6 +807,24 @@ class PipelineSR:
         if self._output_queue:
             return self._output_queue.popleft()
         return None
+
+    def drain(self) -> list:
+        """排空流水线中所有剩余帧，返回未取出的处理结果列表。
+        
+        应在主循环结束后、stop() 之前调用，确保所有已提交的帧都被处理并收集。
+        """
+        results = []
+        # 等待 Worker 处理完所有已提交的帧
+        while self._input_queue:
+            if not self.running:
+                break
+            time.sleep(0.001)
+        # 短暂等待 Worker 将最后结果放入输出队列
+        time.sleep(0.02)
+        # 收集所有剩余结果
+        while self._output_queue:
+            results.append(self._output_queue.popleft())
+        return results
 
     @property
     def is_busy(self) -> bool:
@@ -848,10 +873,11 @@ def run_pipeline_video(args: argparse.Namespace) -> None:
         主线程 (读帧+显示)  <->  PipelineSR (独立 Worker 线程做 GPU 推理)
 
     流程:
-        1. 主线程读取一帧 -> 提交到输入队列 (非阻塞)
+        1. 主线程按源帧率读取一帧 -> 背压提交到输入队列 (不丢帧)
         2. Worker 线程从输入队列取帧 -> GPU 推理 -> 放入输出队列
-        3. 主线程从输出队列取结果 -> 显示 (非阻塞)
-        4. 读帧和显示不等待推理完成，两者并行
+        3. 主线程从输出队列取结果 -> 显示/写入 (非阻塞)
+        4. 视频文件模式下 FPS 限速读取，防止超前缓冲
+        5. 主循环结束后 drain() 排空所有剩余帧再停止
     """
     source = args.source
     if source.isdigit():
@@ -900,6 +926,10 @@ def run_pipeline_video(args: argparse.Namespace) -> None:
             break
         pipeline.submit(frame)
 
+    # ---- 判断视频源类型（用于 FPS 限速）----
+    is_video_file = not (isinstance(source, int) or
+                         (isinstance(source, str) and source.isdigit()))
+
     # ===== 主循环 =====
     while True:
         # 1. 读取一帧
@@ -909,7 +939,14 @@ def run_pipeline_video(args: argparse.Namespace) -> None:
 
         frame_count += 1
 
-        # 2. 提交到流水线 (非阻塞，立即返回)
+        # ---- FPS 限速：视频文件按源帧率节流读取 ----
+        if is_video_file:
+            target_elapsed = frame_count / cap.fps
+            actual_elapsed = time.time() - read_start
+            if actual_elapsed < target_elapsed:
+                time.sleep(min(target_elapsed - actual_elapsed, 0.05))
+
+        # 2. 提交到流水线 (背压阻塞，确保不丢帧)
         pipeline.submit(frame_rgb)
 
         # 3. 获取最新处理结果 (非阻塞)
@@ -941,6 +978,25 @@ def run_pipeline_video(args: argparse.Namespace) -> None:
             break
 
     # ===== 清理 =====
+    # 排空流水线中剩余的帧（确保所有已提交帧都被写入）
+    remaining = pipeline.drain()
+    for sr_frame in remaining:
+        display_count += 1
+        if args.show_fps:
+            elapsed = time.time() - read_start
+            if elapsed > 0:
+                fps_display = f"FPS: {display_count / elapsed:.1f}"
+            sr_frame = draw_texts(sr_frame, [
+                (fps_display, (10, 10), green),
+                (f"[{backend_info}] {in_width}x{in_height} -> {out_width}x{out_height}",
+                 (10, 10 + display.font_size + 6), green),
+            ], display.font)
+        display.show(sr_frame)
+        if writer:
+            writer.write(sr_frame)
+        if display.refresh():
+            break
+
     pipeline.stop()
     cap.close()
     if writer:
