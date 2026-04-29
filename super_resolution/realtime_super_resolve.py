@@ -2,6 +2,7 @@
 """
 实时视频超分辨率Demo (无OpenCV版本) — 流水线优化版
 Real-Time Video Super Resolution Demo (OpenCV-Free)
+支持 PyTorch / ONNX Runtime 双后端，INT8 量化推理
 
 === 性能优化 ===
 采用三缓冲流水线架构 (Triple Buffering Pipeline) 消除 CPU/GPU 串行等待：
@@ -15,13 +16,25 @@ Real-Time Video Super Resolution Demo (OpenCV-Free)
   - 减少 CPU↔GPU 同步传输次数
   - 流水线并行化使 CPU 和 GPU 同时工作
   - 无锁环形缓冲区队列，避免 GIL 争用
+  - ONNX Runtime 后端减少 kernel launch 开销
+  - INT8 量化推理降低内存带宽需求
 
-安装依赖 (仅需 2 个额外包):
+安装依赖:
     pip install imageio imageio-ffmpeg
+    pip install onnxruntime-gpu onnxruntime-quantization   # ONNX 后端
 
 使用方法:
-    python realtime_super_resolve.py --model models/himage/model_epoch_80.pth --upscale 4 --source 0
-    python realtime_super_resolve.py --model models/himage/model_epoch_99.pth --upscale 2 --source video.mp4 --gpu
+    # PyTorch 后端 (默认)
+    python realtime_super_resolve.py --model models/himage4/model_epoch_99.pth --upscale 4 --source 0
+
+    # ONNX Runtime 后端 (FP32)
+    python realtime_super_resolve.py --model model_4x.onnx --upscale 4 --source 0 --backend onnx
+
+    # ONNX Runtime 后端 (INT8 量化)
+    python realtime_super_resolve.py --model model_4x_int8.onnx --upscale 4 --source 0 --backend onnx
+
+    # ONNX + GPU
+    python realtime_super_resolve.py --model model_4x_int8.onnx --upscale 4 --source video.mp4 --gpu --backend onnx
 """
 
 from __future__ import annotations
@@ -35,10 +48,28 @@ from collections import deque
 from typing import Optional, Sequence, Union
 
 import numpy as np
-import torch
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
-from model import Net
+# ---- 延迟导入后端模块 (避免未安装时的 ImportError) ----
+_onnxruntime = None
+_ORTBackend = None
+
+def _get_onnx_backend():
+    """延迟加载 ONNX Runtime 后端"""
+    global _ORTBackend
+    if _ORTBackend is not None:
+        return _ORTBackend
+    try:
+        import onnxruntime as _ort
+        global _onnxruntime
+        _onnxruntime = _ort
+        _ORTBackend = True
+        print("[INFO] ONNX Runtime 后端可用")
+    except ImportError:
+        print("[ERROR] ONNX Runtime 未安装，请运行: pip install onnxruntime-gpu")
+        sys.exit(1)
+    return _ORTBackend
+
 
 # ---- 延迟导入 imageio (仅视频文件时需要) ----
 
@@ -126,8 +157,8 @@ def draw_texts(
 class VideoSource:
     """统一视频源接口：支持摄像头和视频文件。
 
-    视频文件 → imageio-ffmpeg (可选 NVDEC GPU 硬件解码)
-    摄像头   → ffmpeg 子进程 MJPEG 管道 + Pillow 解码
+    视频文件 -> imageio-ffmpeg (可选 NVDEC GPU 硬件解码)
+    摄像头   -> ffmpeg 子进程 MJPEG 管道 + Pillow 解码
     """
 
     def __init__(self, source: Union[int, str], use_gpu: bool = True):
@@ -512,21 +543,27 @@ class Display:
 
 
 # ============================================================================
-#  超分辨率模型封装
+#  超分辨率模型封装 —— PyTorch 后端
 # ============================================================================
 
-class SuperResolutionModel:
-    """超分辨率模型封装 —— 输入输出均为 RGB uint8"""
+class PyTorchSRModel:
+    """PyTorch 超分辨率推理封装"""
 
     def __init__(self, model_path: str, upscale_factor: int = 4, use_gpu: bool = True):
+        import torch
+        from model import Net
+        
         self.upscale_factor = upscale_factor
         self.use_gpu = use_gpu and torch.cuda.is_available()
         self.device = torch.device("cuda" if self.use_gpu else "cpu")
         self._load_model(model_path)
 
     def _load_model(self, model_path: str) -> None:
-        print(f"[INFO] 正在加载模型: {model_path}")
-        print(f"[INFO] 使用设备: {self.device}")
+        import torch
+        from model import Net
+        
+        print(f"[INFO] [PyTorch] 正在加载模型: {model_path}")
+        print(f"[INFO] [PyTorch] 使用设备: {self.device}")
 
         with open(model_path, 'rb') as f:
             safe_globals = [
@@ -542,7 +579,6 @@ class SuperResolutionModel:
         if isinstance(loaded, dict):
             state_dict = loaded.get('model_state_dict', loaded)
             # 从 conv7.weight 的 shape 推断 upscale_factor
-            # conv7.out_channels = 3 * (upscale_factor ** 2)
             out_channels = state_dict['conv7.weight'].shape[0]
             upscale_factor = int((out_channels // 3) ** 0.5)
             self.model = Net(upscale_factor=upscale_factor)
@@ -552,10 +588,10 @@ class SuperResolutionModel:
 
         self.model = self.model.to(self.device)
         self.model.eval()
-        print("[INFO] 模型加载完成!")
+        print("[INFO] [PyTorch] 模型加载完成!")
 
     def process(self, frame_rgb: np.ndarray) -> np.ndarray:
-        """处理单帧 RGB 图像 — 优化版：跳过 PIL Image 创建，直接用 torch.from_numpy
+        """处理单帧 RGB 图像
 
         Args:
             frame_rgb: (H, W, 3) uint8
@@ -563,8 +599,9 @@ class SuperResolutionModel:
         Returns:
             (H*scale, W*scale, 3) uint8
         """
+        import torch
+        
         # HWC -> CHW, uint8 -> float32, 归一化到 [0,1]
-        # 避免 PIL Image.fromarray + ToTensor 的开销
         tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).float().div(255.0)
         input_tensor = tensor.unsqueeze(0).to(self.device, non_blocking=True)
 
@@ -577,6 +614,109 @@ class SuperResolutionModel:
         output_np = output_tensor.permute(1, 2, 0).numpy()
         output_np = (output_np * 255.0).clip(0, 255).astype(np.uint8)
         return output_np
+
+    def get_info(self) -> str:
+        return f"PyTorch ({self.device})"
+
+
+# ============================================================================
+#  超分辨率模型封装 —— ONNX Runtime 后端
+# ============================================================================
+
+class ONNXSRModel:
+    """ONNX Runtime 超分辨率推理封装（支持 INT8 量化模型）"""
+
+    def __init__(self, model_path: str, upscale_factor: int = 4, use_gpu: bool = True):
+        _get_onnx_backend()  # 确保 onnxruntime 已导入
+        import onnxruntime as ort
+        
+        self.upscale_factor = upscale_factor
+        self.use_gpu = use_gpu
+        self._load_model(model_path)
+
+    def _load_model(self, model_path: str) -> None:
+        import onnxruntime as ort
+        
+        print(f"[INFO] [ONNX] 正在加载模型: {model_path}")
+
+        providers = []
+        if self.use_gpu:
+            providers = [
+                ("CUDAExecutionProvider", {
+                    "device_id": 0,
+                    "arena_extend_strategy": "kNextPowerOfTwo",
+                }),
+                "CPUExecutionProvider",
+            ]
+            print(f"[INFO] [ONNX] 使用 GPU: CUDAExecutionProvider")
+        else:
+            providers = ["CPUExecutionProvider"]
+            print(f"[INFO] [ONNX] 使用 CPU: CPUExecutionProvider")
+
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        sess_options.intra_op_num_threads = 4
+        sess_options.inter_op_num_threads = 2
+
+        self.session = ort.InferenceSession(
+            model_path, sess_options=sess_options, providers=providers
+        )
+        self.input_name = self.session.get_inputs()[0].name
+        self.output_name = self.session.get_outputs()[0].name
+
+        # 打印模型信息
+        print(f"[INFO] [ONNX] 模型加载完成!")
+        print(f"        输入: {self.session.get_inputs()[0]}")
+        print(f"        输出: {self.session.get_outputs()[0]}")
+        print(f"        提供者: {self.session.get_providers()[0]}")
+
+    def process(self, frame_rgb: np.ndarray) -> np.ndarray:
+        """处理单帧 RGB 图像
+
+        Args:
+            frame_rgb: (H, W, 3) uint8
+
+        Returns:
+            (H*scale, W*scale, 3) uint8
+        """
+        # HWC -> CHW, uint8 -> float32, 归一化到 [0,1]
+        # 确保内存连续 (ascontiguousarray) 对 ONNX Runtime 很重要
+        tensor = np.ascontiguousarray(
+            frame_rgb.transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32) / 255.0
+        )
+
+        # ONNX Runtime 推理
+        result = self.session.run([self.output_name], {self.input_name: tensor})[0]
+
+        # NCHW -> HWC uint8
+        out = (result[0].transpose(1, 2, 0) * 255.0).clip(0, 255).astype(np.uint8)
+        return out
+
+    def get_info(self) -> str:
+        import onnxruntime as ort
+        provider = self.session.get_providers()[0]
+        return f"ONNX ({provider})"
+
+
+# ============================================================================
+#  模型工厂
+# ============================================================================
+
+def create_sr_model(model_path: str, upscale_factor: int, use_gpu: bool,
+                    backend: str = "auto") -> Union[PyTorchSRModel, ONNXSRModel]:
+    """根据模型文件扩展名和 backend 参数自动选择后端
+
+    Args:
+        model_path: 模型文件路径 (.pth = PyTorch, .onnx = ONNX Runtime)
+        upscale_factor: 上采样倍数
+        use_gpu: 是否使用 GPU
+        backend: "auto" | "pytorch" | "onnx"
+    """
+    if backend == "onnx" or (backend == "auto" and model_path.endswith('.onnx')):
+        _get_onnx_backend()
+        return ONNXSRModel(model_path, upscale_factor, use_gpu)
+    else:
+        return PyTorchSRModel(model_path, upscale_factor, use_gpu)
 
 
 # ============================================================================
@@ -614,17 +754,18 @@ class PipelineSR:
     """三缓冲流水线超分辨率处理器。
 
     架构:
-        [Reader 线程] → 输入队列 → [SR Worker 线程] → 输出队列 → [Display 主线程]
+        [Reader 线程] -> 输入队列 -> [SR Worker 线程] -> 输出队列 -> [Display 主线程]
 
     优势:
         - 读帧 (CPU)、SR 推理 (GPU)、显示 (CPU) 三级流水线并行
         - 避免 CPU/GPU 串行等待，使两者同时工作
         - 队列使用 collections.deque，线程安全且无 GIL 争用
         - 输入队列最大 2 帧缓冲，延迟低
+        - 支持 PyTorch / ONNX Runtime 双后端
     """
 
-    def __init__(self, model_path: str, upscale_factor: int = 4, use_gpu: bool = True):
-        self.sr_model = SuperResolutionModel(model_path, upscale_factor, use_gpu)
+    def __init__(self, model: Union[PyTorchSRModel, ONNXSRModel]):
+        self.sr_model = model
         self.running = True
 
         # 无锁双缓冲队列 (deque 的 append/popleft 在 CPython 中是原子的)
@@ -635,7 +776,7 @@ class PipelineSR:
         self._worker.start()
 
     def _worker_loop(self) -> None:
-        """SR Worker 线程：从输入队列取帧 → 推理 → 放入输出队列"""
+        """SR Worker 线程：从输入队列取帧 -> 推理 -> 放入输出队列"""
         while self.running:
             if self._input_queue:
                 frame = self._input_queue.popleft()
@@ -650,9 +791,7 @@ class PipelineSR:
 
     def submit(self, frame_rgb: np.ndarray) -> None:
         """提交一帧（非阻塞）。如果队列满则丢弃旧帧，始终保留最新帧。"""
-        # maxlen 在 __init__ 中固定为 2，此处直接硬编码避免类型检查警告
         if len(self._input_queue) >= 2:
-            # 队列满时丢弃最旧帧，确保始终处理最新帧
             self._input_queue.popleft()
         self._input_queue.append(frame_rgb)
 
@@ -680,8 +819,8 @@ class PipelineSR:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='实时视频超分辨率 (无OpenCV)')
     parser.add_argument('--model', type=str,
-                        default='models/himage/model_epoch_99.pth',
-                        help='模型文件路径')
+                        default='models/himage4/model_epoch_99.pth',
+                        help='模型文件路径 (.pth=PyTorch, .onnx=ONNX Runtime)')
     parser.add_argument('--upscale', type=int, default=2,
                         help='上采样倍数 (2, 3, 4)')
     parser.add_argument('--source', type=str, default='0',
@@ -692,6 +831,9 @@ def parse_args() -> argparse.Namespace:
                         help='显示 FPS')
     parser.add_argument('--output', type=str, default=None,
                         help='输出视频文件路径')
+    parser.add_argument('--backend', type=str, default='auto',
+                        choices=['auto', 'pytorch', 'onnx'],
+                        help='推理后端 (auto: .onnx 文件自动用 ONNX Runtime, 否则 PyTorch)')
     return parser.parse_args()
 
 
@@ -703,12 +845,12 @@ def run_pipeline_video(args: argparse.Namespace) -> None:
     """三缓冲流水线超分辨率实时视频处理。
 
     流水线:
-        主线程 (读帧+显示)  ←→  PipelineSR (独立 Worker 线程做 GPU 推理)
+        主线程 (读帧+显示)  <->  PipelineSR (独立 Worker 线程做 GPU 推理)
 
     流程:
-        1. 主线程读取一帧 → 提交到输入队列 (非阻塞)
-        2. Worker 线程从输入队列取帧 → GPU 推理 → 放入输出队列
-        3. 主线程从输出队列取结果 → 显示 (非阻塞)
+        1. 主线程读取一帧 -> 提交到输入队列 (非阻塞)
+        2. Worker 线程从输入队列取帧 -> GPU 推理 -> 放入输出队列
+        3. 主线程从输出队列取结果 -> 显示 (非阻塞)
         4. 读帧和显示不等待推理完成，两者并行
     """
     source = args.source
@@ -716,18 +858,25 @@ def run_pipeline_video(args: argparse.Namespace) -> None:
         source = int(source)
 
     cap = VideoSource(source, use_gpu=args.gpu)
-    pipeline = PipelineSR(args.model, args.upscale, args.gpu)
+
+    # 根据 backend 参数创建模型
+    sr_model = create_sr_model(
+        args.model, args.upscale, args.gpu, backend=args.backend
+    )
+    pipeline = PipelineSR(sr_model)
 
     in_width, in_height = cap.width, cap.height
     out_width = in_width * args.upscale
     out_height = in_height * args.upscale
 
+    backend_info = sr_model.get_info()
     print(f"流水线模式 - {in_width}x{in_height} -> {out_width}x{out_height}")
+    print(f"推理后端: {backend_info}")
     print(f"源 FPS: {cap.fps:.1f}")
     print("按 'q' / 'Esc' 退出, 'f' 切换全屏")
 
     display = Display(
-        f"Pipeline SR {args.upscale}x  |  {in_width}x{in_height} -> {out_width}x{out_height}",
+        f"Pipeline SR {args.upscale}x ({backend_info}) | {in_width}x{in_height} -> {out_width}x{out_height}",
         out_width, out_height,
     )
 
@@ -776,7 +925,7 @@ def run_pipeline_video(args: argparse.Namespace) -> None:
                     fps_display = f"FPS: {display_count / elapsed:.1f}"
                 sr_frame = draw_texts(sr_frame, [
                     (fps_display, (10, 10), green),
-                    (f"[Pipe] {in_width}x{in_height} -> {out_width}x{out_height}",
+                    (f"[{backend_info}] {in_width}x{in_height} -> {out_width}x{out_height}",
                      (10, 10 + display.font_size + 6), green),
                 ], display.font)
 

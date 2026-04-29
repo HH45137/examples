@@ -27,3 +27,4 @@ docs/venv
 /super_resolution/image
 super_resolution/cmd.bat
 super_resolution/weights.h
+*.onnx
