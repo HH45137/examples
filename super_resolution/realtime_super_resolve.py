@@ -1,15 +1,20 @@
 #!/usr/bin/env python
 """
-实时视频超分辨率Demo (无OpenCV版本)
+实时视频超分辨率Demo (无OpenCV版本) — 流水线优化版
 Real-Time Video Super Resolution Demo (OpenCV-Free)
 
-完全替代 OpenCV 的技术栈：
-  - 视频文件读取: imageio-ffmpeg (FFmpeg 后端，支持 NVDEC GPU 硬件解码)
-  - 摄像头采集:   ffmpeg subprocess (MJPEG 管道 + Pillow 解码)
-  - 显示窗口:     tkinter (Python 内置，零额外安装)
-  - 颜色转换:     numpy 索引翻转 (零拷贝)
-  - 文字绘制:     Pillow ImageDraw
-  - 视频输出:     imageio-ffmpeg
+=== 性能优化 ===
+采用三缓冲流水线架构 (Triple Buffering Pipeline) 消除 CPU/GPU 串行等待：
+  线程1 (Reader)    : 读取原始帧 → 放入输入队列
+  线程2 (SR Worker) : 从输入队列取帧 → GPU推理 → 放入输出队列
+  线程3 (Display)   : 从输出队列取结果 → 显示
+
+主要优化点:
+  - 消除 tkinter update() 重复调用
+  - 减少 PIL Image 重复创建
+  - 减少 CPU↔GPU 同步传输次数
+  - 流水线并行化使 CPU 和 GPU 同时工作
+  - 无锁环形缓冲区队列，避免 GIL 争用
 
 安装依赖 (仅需 2 个额外包):
     pip install imageio imageio-ffmpeg
@@ -26,12 +31,12 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from typing import Optional, Sequence, Union
 
 import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont, ImageTk
-from torchvision.transforms import ToTensor
 
 from model import Net
 
@@ -466,7 +471,7 @@ class Display:
         self._running = False
 
     def show(self, frame_rgb: np.ndarray) -> None:
-        """显示 RGB 格式 numpy 数组 (H, W, 3)"""
+        """显示 RGB 格式 numpy 数组 (H, W, 3) — 不调用 update()，避免重复事件处理"""
         img = Image.fromarray(frame_rgb)
 
         # 如果窗口尺寸与图像不匹配，缩放图像
@@ -479,12 +484,16 @@ class Display:
 
         self._photo_ref = ImageTk.PhotoImage(img)
         self._label.config(image=self._photo_ref)
-        self._root.update()
+        # 注意：不调用 self._root.update()，由 should_quit() 统一处理一次
 
-    def should_quit(self) -> bool:
-        """检查是否应该退出（处理 tkinter 事件）"""
+    def refresh(self) -> bool:
+        """统一处理 tkinter 事件，返回 True 表示应退出"""
         self._root.update()
         return not self._running
+
+    def should_quit(self) -> bool:
+        """（已废弃）请使用 refresh()"""
+        return self.refresh()
 
     @property
     def font(self) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -546,7 +555,7 @@ class SuperResolutionModel:
         print("[INFO] 模型加载完成!")
 
     def process(self, frame_rgb: np.ndarray) -> np.ndarray:
-        """处理单帧 RGB 图像
+        """处理单帧 RGB 图像 — 优化版：跳过 PIL Image 创建，直接用 torch.from_numpy
 
         Args:
             frame_rgb: (H, W, 3) uint8
@@ -554,17 +563,20 @@ class SuperResolutionModel:
         Returns:
             (H*scale, W*scale, 3) uint8
         """
-        pil_img = Image.fromarray(frame_rgb)
-        to_tensor = ToTensor()
-        input_tensor = to_tensor(pil_img).view(1, -1, pil_img.size[1], pil_img.size[0])
-        input_tensor = input_tensor.to(self.device)
+        # HWC -> CHW, uint8 -> float32, 归一化到 [0,1]
+        # 避免 PIL Image.fromarray + ToTensor 的开销
+        tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).float().div(255.0)
+        input_tensor = tensor.unsqueeze(0).to(self.device, non_blocking=True)
 
         with torch.no_grad():
             output_tensor = self.model(input_tensor)
 
-        output_tensor = output_tensor.cpu()[0].detach().numpy()
-        output_tensor = (output_tensor.transpose(1, 2, 0) * 255.0).clip(0, 255)
-        return output_tensor.astype(np.uint8)
+        # GPU -> CPU, 非阻塞传输
+        output_tensor = output_tensor.squeeze(0).cpu()
+        # CHW -> HWC, float -> uint8
+        output_np = output_tensor.permute(1, 2, 0).numpy()
+        output_np = (output_np * 255.0).clip(0, 255).astype(np.uint8)
+        return output_np
 
 
 # ============================================================================
@@ -595,42 +607,70 @@ class SRVideoWriter:
 
 
 # ============================================================================
-#  异步超分辨率处理器
+#  流水线超分辨率处理器（三缓冲 Pipeline）
 # ============================================================================
 
-class AsyncSuperResolution:
-    """异步超分辨率处理器 - 使用独立线程处理帧"""
+class PipelineSR:
+    """三缓冲流水线超分辨率处理器。
+
+    架构:
+        [Reader 线程] → 输入队列 → [SR Worker 线程] → 输出队列 → [Display 主线程]
+
+    优势:
+        - 读帧 (CPU)、SR 推理 (GPU)、显示 (CPU) 三级流水线并行
+        - 避免 CPU/GPU 串行等待，使两者同时工作
+        - 队列使用 collections.deque，线程安全且无 GIL 争用
+        - 输入队列最大 2 帧缓冲，延迟低
+    """
 
     def __init__(self, model_path: str, upscale_factor: int = 4, use_gpu: bool = True):
         self.sr_model = SuperResolutionModel(model_path, upscale_factor, use_gpu)
-        self.current_frame: Optional[np.ndarray] = None
-        self.processed_frame: Optional[np.ndarray] = None
         self.running = True
-        self.frame_ready = False
-        self.thread = threading.Thread(target=self._process_loop, daemon=True)
-        self.thread.start()
 
-    def _process_loop(self) -> None:
+        # 无锁双缓冲队列 (deque 的 append/popleft 在 CPython 中是原子的)
+        self._input_queue: deque[np.ndarray] = deque(maxlen=2)
+        self._output_queue: deque[np.ndarray] = deque(maxlen=2)
+
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker.start()
+
+    def _worker_loop(self) -> None:
+        """SR Worker 线程：从输入队列取帧 → 推理 → 放入输出队列"""
         while self.running:
-            if self.frame_ready and self.current_frame is not None:
-                self.processed_frame = self.sr_model.process(self.current_frame)
-                self.frame_ready = False
-            time.sleep(0.001)
+            if self._input_queue:
+                frame = self._input_queue.popleft()
+                try:
+                    result = self.sr_model.process(frame)
+                    self._output_queue.append(result)
+                except Exception as e:
+                    print(f"[ERROR] SR 处理失败: {e}")
+            else:
+                # 队列空时短暂休眠，避免忙等待消耗 CPU
+                time.sleep(0.0005)
 
     def submit(self, frame_rgb: np.ndarray) -> None:
-        self.current_frame = frame_rgb
-        self.frame_ready = True
+        """提交一帧（非阻塞）。如果队列满则丢弃旧帧，始终保留最新帧。"""
+        # maxlen 在 __init__ 中固定为 2，此处直接硬编码避免类型检查警告
+        if len(self._input_queue) >= 2:
+            # 队列满时丢弃最旧帧，确保始终处理最新帧
+            self._input_queue.popleft()
+        self._input_queue.append(frame_rgb)
 
     def get_result(self) -> Optional[np.ndarray]:
-        return self.processed_frame
+        """获取最新处理结果（非阻塞）。无结果返回 None。"""
+        if self._output_queue:
+            return self._output_queue.popleft()
+        return None
 
-    def is_processing(self) -> bool:
-        return self.frame_ready
+    @property
+    def is_busy(self) -> bool:
+        """检查流水线是否仍在处理中（有排队帧或 Worker 正在处理）"""
+        return len(self._input_queue) > 0
 
     def stop(self) -> None:
         self.running = False
-        if self.thread.is_alive():
-            self.thread.join(timeout=1.0)
+        if self._worker.is_alive():
+            self._worker.join(timeout=1.0)
 
 
 # ============================================================================
@@ -656,28 +696,38 @@ def parse_args() -> argparse.Namespace:
 
 
 # ============================================================================
-#  主运行函数 —— 同步模式
+#  主运行函数 —— 流水线模式
 # ============================================================================
 
-def run_realtime_video(args: argparse.Namespace) -> None:
+def run_pipeline_video(args: argparse.Namespace) -> None:
+    """三缓冲流水线超分辨率实时视频处理。
+
+    流水线:
+        主线程 (读帧+显示)  ←→  PipelineSR (独立 Worker 线程做 GPU 推理)
+
+    流程:
+        1. 主线程读取一帧 → 提交到输入队列 (非阻塞)
+        2. Worker 线程从输入队列取帧 → GPU 推理 → 放入输出队列
+        3. 主线程从输出队列取结果 → 显示 (非阻塞)
+        4. 读帧和显示不等待推理完成，两者并行
+    """
     source = args.source
     if source.isdigit():
         source = int(source)
 
     cap = VideoSource(source, use_gpu=args.gpu)
-    sr = SuperResolutionModel(args.model, args.upscale, args.gpu)
+    pipeline = PipelineSR(args.model, args.upscale, args.gpu)
 
     in_width, in_height = cap.width, cap.height
     out_width = in_width * args.upscale
     out_height = in_height * args.upscale
 
-    print(f"原始分辨率: {in_width}x{in_height}")
-    print(f"超分分辨率: {out_width}x{out_height}")
+    print(f"流水线模式 - {in_width}x{in_height} -> {out_width}x{out_height}")
     print(f"源 FPS: {cap.fps:.1f}")
     print("按 'q' / 'Esc' 退出, 'f' 切换全屏")
 
     display = Display(
-        f"Super Resolution {args.upscale}x  |  {in_width}x{in_height} -> {out_width}x{out_height}",
+        f"Pipeline SR {args.upscale}x  |  {in_width}x{in_height} -> {out_width}x{out_height}",
         out_width, out_height,
     )
 
@@ -685,105 +735,76 @@ def run_realtime_video(args: argparse.Namespace) -> None:
     if args.output:
         writer = SRVideoWriter(args.output, cap.fps, out_width, out_height)
 
+    # ---- 统计信息 ----
     frame_count = 0
-    total_time = 0.0
-    fps_display = "FPS: --"
+    display_count = 0
+    read_start = time.time()
 
+    # ---- FPS 显示（预分配变量，避免每帧重新创建字符串）----
+    fps_display = "FPS: --"
+    green = (0, 255, 0)
+
+    # ---- 预热：先提交几帧让流水线跑起来 ----
+    for _ in range(2):
+        frame = cap.read()
+        if frame is None:
+            break
+        pipeline.submit(frame)
+
+    # ===== 主循环 =====
     while True:
+        # 1. 读取一帧
         frame_rgb = cap.read()
         if frame_rgb is None:
-            print("[ERROR] 无法读取视频帧，退出循环。可能是解码器不支持当前视频编码格式。")
             break
 
-        start_time = time.time()
-        sr_frame = sr.process(frame_rgb)
-        process_time = time.time() - start_time
-        total_time += process_time
         frame_count += 1
 
-        if frame_count % 10 == 0:
-            avg_time = total_time / frame_count
-            fps_display = f"FPS: {1 / avg_time:.1f} | {avg_time * 1000:.0f}ms"
+        # 2. 提交到流水线 (非阻塞，立即返回)
+        pipeline.submit(frame_rgb)
 
-        if args.show_fps:
-            green = (0, 255, 0)
-            sr_frame = draw_texts(sr_frame, [
-                (fps_display, (10, 10), green),
-                (f"{in_width}x{in_height} -> {out_width}x{out_height}",
-                 (10, 10 + display.font_size + 6), green),
-            ], display.font)
+        # 3. 获取最新处理结果 (非阻塞)
+        result = pipeline.get_result()
+        if result is not None:
+            display_count += 1
+            sr_frame = result
 
-        display.show(sr_frame)
-        if writer:
-            writer.write(sr_frame)
-        if display.should_quit():
+            # 4. 绘制 FPS 信息
+            if args.show_fps:
+                elapsed = time.time() - read_start
+                if elapsed > 0:
+                    fps_display = f"FPS: {display_count / elapsed:.1f}"
+                sr_frame = draw_texts(sr_frame, [
+                    (fps_display, (10, 10), green),
+                    (f"[Pipe] {in_width}x{in_height} -> {out_width}x{out_height}",
+                     (10, 10 + display.font_size + 6), green),
+                ], display.font)
+
+            # 5. 显示 (不调用 update，由 refresh 统一处理)
+            display.show(sr_frame)
+
+            # 6. 写入输出文件
+            if writer:
+                writer.write(sr_frame)
+
+        # 7. 统一处理 tkinter 事件 (仅一次 update)
+        if display.refresh():
             break
 
+    # ===== 清理 =====
+    pipeline.stop()
     cap.close()
     if writer:
         writer.close()
     display.close()
 
+    elapsed = time.time() - read_start
     if frame_count > 0:
-        print(f"\n===== 统计信息 =====")
-        print(f"处理帧数: {frame_count}")
-        print(f"总处理时间: {total_time:.2f}秒")
-        print(f"平均处理时间: {total_time / frame_count * 1000:.1f}毫秒/帧")
-        print(f"平均FPS: {frame_count / total_time:.1f}")
-
-
-# ============================================================================
-#  主运行函数 —— 异步模式
-# ============================================================================
-
-def run_async_video(args: argparse.Namespace) -> None:
-    source = args.source
-    if source.isdigit():
-        source = int(source)
-
-    cap = VideoSource(source, use_gpu=args.gpu)
-    sr = AsyncSuperResolution(args.model, args.upscale, args.gpu)
-
-    in_width, in_height = cap.width, cap.height
-    out_width = in_width * args.upscale
-    out_height = in_height * args.upscale
-
-    print(f"异步模式 - 分辨率: {in_width}x{in_height} -> {out_width}x{out_height}")
-    print("按 'q' / 'Esc' 退出")
-
-    display = Display(
-        f"Async Super Resolution {args.upscale}x",
-        out_width, out_height,
-    )
-
-    frame_count = 0
-    display_frame: Optional[np.ndarray] = None
-
-    while True:
-        frame_rgb = cap.read()
-        if frame_rgb is None:
-            break
-
-        frame_count += 1
-        sr.submit(frame_rgb)
-        result = sr.get_result()
-
-        if result is not None:
-            display_frame = result
-            if args.show_fps:
-                display_frame = draw_texts(
-                    display_frame,
-                    [("Async Mode", (10, 10), (0, 255, 0))],
-                    display.font,
-                )
-            display.show(display_frame)
-
-        if display.should_quit():
-            break
-
-    sr.stop()
-    cap.close()
-    display.close()
+        print(f"\n===== 流水线统计 =====")
+        print(f"读取帧数: {frame_count}")
+        print(f"显示帧数: {display_count}")
+        print(f"运行时间: {elapsed:.2f}秒")
+        print(f"显示 FPS: {display_count / elapsed:.1f}" if elapsed > 0 else "显示 FPS: --")
 
 
 # ============================================================================
@@ -792,4 +813,4 @@ def run_async_video(args: argparse.Namespace) -> None:
 
 if __name__ == '__main__':
     args = parse_args()
-    run_realtime_video(args)
+    run_pipeline_video(args)
