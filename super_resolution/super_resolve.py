@@ -26,7 +26,19 @@ with open(opt.model, 'rb') as f:
         torch.nn.modules.pixelshuffle.PixelShuffle,
     ]
     with torch.serialization.safe_globals(safe_globals):
-        model = torch.load(f, weights_only=False)
+        loaded = torch.load(f, weights_only=False)
+
+# 兼容 dict 格式的 checkpoint（训练时常用 torch.save({'model_state_dict': ...})）
+if isinstance(loaded, dict):
+    state_dict = loaded.get('model_state_dict', loaded)
+    # 从 conv7.weight 的 shape 推断 upscale_factor
+    # conv7.out_channels = 3 * (upscale_factor ** 2)
+    out_channels = state_dict['conv7.weight'].shape[0]
+    upscale_factor = int((out_channels // 3) ** 0.5)
+    model = Net(upscale_factor=upscale_factor)
+    model.load_state_dict(state_dict)
+else:
+    model = loaded
 
 img_to_tensor = ToTensor()
 input = img_to_tensor(img).view(1, -1, img.size[1], img.size[0])
