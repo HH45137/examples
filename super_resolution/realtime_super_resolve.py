@@ -306,8 +306,11 @@ class VideoSource:
 
         ffmpeg_params: list[str] = []
         if self._use_gpu and _has_nvidia_gpu():
-            ffmpeg_params = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
-            print("[INFO] 启用 FFmpeg NVDEC GPU 硬件解码")
+            # 注意: 不能使用 -hwaccel_output_format cuda，因为 imageio-ffmpeg
+            # 需要从 CPU 内存读取帧数据。不指定输出格式则 FFmpeg 默认自动将
+            # 解码后的帧拷贝回系统内存 (auto/0)，确保 imageio 能正常读取。
+            ffmpeg_params = ["-hwaccel", "cuda"]
+            print("[INFO] 启用 FFmpeg NVDEC GPU 硬件解码 (帧自动回拷到系统内存)")
         else:
             print("[INFO] 使用 FFmpeg CPU 软解")
 
@@ -357,7 +360,8 @@ class VideoSource:
             frame = next(self._reader)
         except StopIteration:
             return None
-        except Exception:
+        except Exception as e:
+            print(f"[ERROR] 读取视频帧失败: {e}")
             return None
 
         if frame.dtype != np.uint8:
@@ -523,7 +527,19 @@ class SuperResolutionModel:
                 torch.nn.modules.pixelshuffle.PixelShuffle,
             ]
             with torch.serialization.safe_globals(safe_globals):
-                self.model = torch.load(f, weights_only=False)
+                loaded = torch.load(f, weights_only=False)
+
+        # 兼容 dict 格式的 checkpoint（训练时常用 torch.save({'model_state_dict': ...})）
+        if isinstance(loaded, dict):
+            state_dict = loaded.get('model_state_dict', loaded)
+            # 从 conv7.weight 的 shape 推断 upscale_factor
+            # conv7.out_channels = 3 * (upscale_factor ** 2)
+            out_channels = state_dict['conv7.weight'].shape[0]
+            upscale_factor = int((out_channels // 3) ** 0.5)
+            self.model = Net(upscale_factor=upscale_factor)
+            self.model.load_state_dict(state_dict)
+        else:
+            self.model = loaded
 
         self.model = self.model.to(self.device)
         self.model.eval()
@@ -676,6 +692,7 @@ def run_realtime_video(args: argparse.Namespace) -> None:
     while True:
         frame_rgb = cap.read()
         if frame_rgb is None:
+            print("[ERROR] 无法读取视频帧，退出循环。可能是解码器不支持当前视频编码格式。")
             break
 
         start_time = time.time()
