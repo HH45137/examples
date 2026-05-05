@@ -28,3 +28,6 @@ docs/venv
 super_resolution/cmd.bat
 super_resolution/weights.h
 *.onnx
+super_resolution/weights_rgba32f.raw
+super_resolution/weights_preview.png
+super_resolution/weights_metadata.json
